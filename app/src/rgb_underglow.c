@@ -468,9 +468,12 @@ static void zmk_rgb_underglow_tick(struct k_work *work) {
     LOG_DBG("Tick: current_effect: %d, state.on: %d, state.layer_enabled: %d, animation_step: %d", state.current_effect, state.on, state.layer_enabled, state.animation_step);
     // If layer effect is active and this tick is for its fade, handle it.
     // Otherwise, handle standard effects.
+#if IS_ENABLED(UNDERGLOW_LAYER_ENABLED)
     if (state.layer_enabled && state.current_effect == UNDERGLOW_EFFECT_LAYER_INDICATORS) {
         zmk_rgb_underglow_effect_layer(); // This handles the fade out for layer effects
-    } else {
+    } else
+#endif
+    { // This block executes if UNDERGLOW_LAYER_ENABLED is false, OR if true & the above condition is false.
         // Standard effects
         switch (state.current_effect) {
         case UNDERGLOW_EFFECT_SOLID:
