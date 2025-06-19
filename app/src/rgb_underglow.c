@@ -715,6 +715,7 @@ int zmk_rgb_underglow_select_effect(int effect) {
 
     // Ensure state.on is true if an effect is selected and it's not the layer indicator,
     // or if it is the layer indicator and layer_enabled is now true.
+#if IS_ENABLED(UNDERGLOW_LAYER_ENABLED)
     if (state.layer_enabled) {
         if (!state.on) {
             LOG_DBG("Effect %d is layer indicator, RGB was off, turning on transiently.", effect);
@@ -726,7 +727,9 @@ int zmk_rgb_underglow_select_effect(int effect) {
             k_timer_stop(&underglow_tick);
         }
         zmk_rgb_underglow_set_layer(rgb_underglow_top_layer()); // Apply layer effect immediately
-    } else { // Standard effect selected
+    } else 
+#endif
+    { // Standard effect selected, or UNDERGLOW_LAYER_ENABLED is false
         if (!state.on) {
             LOG_DBG("Standard effect %d selected, RGB was off, turning on fully.", effect);
             zmk_rgb_underglow_on(); // If switching to standard effect, ensure it's fully on
