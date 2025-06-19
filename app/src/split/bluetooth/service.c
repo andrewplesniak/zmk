@@ -181,8 +181,8 @@ static ssize_t split_svc_get_selected_phys_layout(struct bt_conn *conn,
 static uint32_t layers = 0;
 
 static void split_svc_update_layers_callback(struct k_work *work) {
-    LOG_DBG("Setting peripheral layers: %x", layers);
-    // set_peripheral_layers_state(layers);
+    LOG_DBG("Peripheral: Received layers update: 0x%08x, invoking callback.", layers);
+    // set_peripheral_layers_state(layers); // This was commented out in your diff, ensure it's handled if needed elsewhere or by the event
     raise_zmk_split_peripheral_layer_changed(
         (struct zmk_split_peripheral_layer_changed){.layers = layers});
 }

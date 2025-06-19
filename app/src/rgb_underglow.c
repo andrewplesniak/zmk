@@ -288,9 +288,16 @@ static void zmk_led_write_pixels(void) {
         }
     }
 
+    LOG_DBG("zmk_led_write_pixels: state.on=%d, state.layer_enabled=%d, state.status_active=%d, current_effect=%d", state.on, state.layer_enabled, state.status_active, state.current_effect);
+    if (STRIP_NUM_PIXELS > 0) {
+        LOG_DBG("led_buffer[0]: r=%d g=%d b=%d", led_buffer[0].r, led_buffer[0].g, led_buffer[0].b);
+        if (STRIP_NUM_PIXELS > 1) {
+            LOG_DBG("led_buffer[end]: r=%d g=%d b=%d", led_buffer[STRIP_NUM_PIXELS-1].r, led_buffer[STRIP_NUM_PIXELS-1].g, led_buffer[STRIP_NUM_PIXELS-1].b);
+        }
+    }
     int err = led_strip_update_rgb(led_strip, led_buffer, STRIP_NUM_PIXELS);
-    if (err < 0) {
-        LOG_ERR("Failed to update the RGB strip (%d)", err);
+    if (err) { // Changed from err < 0 to err != 0 as per Zephyr docs for led_strip_update_rgb
+        LOG_ERR("Failed to update LED strip: %d", err);
     }
 
     if (reset_ext_power) {
@@ -458,26 +465,39 @@ static inline struct led_rgb hue_sat(int hue, int sat) {
 }
 
 static void zmk_rgb_underglow_tick(struct k_work *work) {
-    switch (state.current_effect) {
-    case UNDERGLOW_EFFECT_SOLID:
-        zmk_rgb_underglow_effect_solid();
-        break;
-    case UNDERGLOW_EFFECT_BREATHE:
-        zmk_rgb_underglow_effect_breathe();
-        break;
-    case UNDERGLOW_EFFECT_SPECTRUM:
-        zmk_rgb_underglow_effect_spectrum();
-        break;
-    case UNDERGLOW_EFFECT_SWIRL:
-        zmk_rgb_underglow_effect_swirl();
-        break;
-#if IS_ENABLED(UNDERGLOW_LAYER_ENABLED)
-    case UNDERGLOW_EFFECT_LAYER_INDICATORS:
-        zmk_rgb_underglow_effect_layer();
-        break;
-#endif
+    LOG_DBG("Tick: current_effect: %d, state.on: %d, state.layer_enabled: %d, animation_step: %d", state.current_effect, state.on, state.layer_enabled, state.animation_step);
+    // If layer effect is active and this tick is for its fade, handle it.
+    // Otherwise, handle standard effects.
+    if (state.layer_enabled && state.current_effect == UNDERGLOW_EFFECT_LAYER_INDICATORS) {
+        zmk_rgb_underglow_effect_layer(); // This handles the fade out for layer effects
+    } else {
+        // Standard effects
+        switch (state.current_effect) {
+        case UNDERGLOW_EFFECT_SOLID:
+            zmk_rgb_underglow_effect_solid();
+            break;
+        case UNDERGLOW_EFFECT_BREATHE:
+            zmk_rgb_underglow_effect_breathe();
+            break;
+        case UNDERGLOW_EFFECT_SPECTRUM:
+            zmk_rgb_underglow_effect_spectrum();
+            break;
+        case UNDERGLOW_EFFECT_SWIRL:
+            zmk_rgb_underglow_effect_swirl();
+            break;
+        // NOTE: UNDERGLOW_EFFECT_LAYER_INDICATORS is handled above if state.layer_enabled is true.
+        // If state.layer_enabled is false but effect is somehow LAYER_INDICATORS, it will do nothing here.
+        default:
+            // This case should ideally not be reached if state.current_effect is always valid.
+            // If it's an unknown effect or LAYER_INDICATORS without layer_enabled, clear pixels or do solid.
+            if (state.on) zmk_rgb_underglow_effect_solid(); // Default to solid if effect is weird but on
+            break;
+        }
     }
 
+    if (STRIP_NUM_PIXELS > 0) {
+         LOG_DBG("Tick: pixels[0] after effect: r=%d g=%d b=%d", pixels[0].r, pixels[0].g, pixels[0].b);
+    }
     zmk_led_write_pixels();
 }
 
@@ -680,11 +700,38 @@ int zmk_rgb_underglow_select_effect(int effect) {
         return -EINVAL;
     }
 
+    LOG_DBG("Selecting effect: %d. Current effect: %d", effect, state.current_effect);
     state.current_effect = effect;
     state.animation_step = 0;
+
 #if IS_ENABLED(UNDERGLOW_LAYER_ENABLED)
+    bool prev_layer_enabled = state.layer_enabled;
     state.layer_enabled = (effect == UNDERGLOW_EFFECT_LAYER_INDICATORS);
+    LOG_DBG("Layer enabled set to: %d (was %d)", state.layer_enabled, prev_layer_enabled);
 #endif
+
+    // Ensure state.on is true if an effect is selected and it's not the layer indicator,
+    // or if it is the layer indicator and layer_enabled is now true.
+    if (state.layer_enabled) {
+        if (!state.on) {
+            LOG_DBG("Effect %d is layer indicator, RGB was off, turning on transiently.", effect);
+            zmk_rgb_underglow_transient_on(); // If switching to layer mode, ensure it's on
+        }
+        // Stop standard timer if it was running, layer effect will manage its own or have no timer
+        if (k_timer_remaining_get(&underglow_tick) > 0 || k_timer_status_get(&underglow_tick) > 0) {
+            LOG_DBG("Stopping standard effect timer as layer indicator effect %d is selected.", effect);
+            k_timer_stop(&underglow_tick);
+        }
+        zmk_rgb_underglow_set_layer(rgb_underglow_top_layer()); // Apply layer effect immediately
+    } else { // Standard effect selected
+        if (!state.on) {
+            LOG_DBG("Standard effect %d selected, RGB was off, turning on fully.", effect);
+            zmk_rgb_underglow_on(); // If switching to standard effect, ensure it's fully on
+        } else { // If already on, restart timer for new standard effect
+            LOG_DBG("Standard effect %d selected, RGB already on, restarting tick timer.", effect);
+            k_timer_start(&underglow_tick, K_NO_WAIT, K_MSEC(50));
+        }
+    }
     return zmk_rgb_underglow_save_state();
 }
 
@@ -744,25 +791,59 @@ static int zmk_rgb_underglow_apply_rgbmap(const struct zmk_behavior_binding *bin
 }
 
 static void zmk_rgb_underglow_set_layer(uint8_t layer) {
-    LOG_DBG("state.layer: %d state.on: %d", state.layer_enabled, state.on);
-    if (!state.layer_enabled)
+    LOG_DBG("zmk_rgb_underglow_set_layer: layer %d. state.layer_enabled: %d, state.on: %d", layer, state.layer_enabled, state.on);
+    if (!state.layer_enabled) {
+        LOG_DBG("Layer effects not enabled, returning.");
+        // If standard effects should resume, ensure the timer is running
+        if (state.on && state.current_effect != UNDERGLOW_EFFECT_LAYER_INDICATORS) {
+             if (!k_timer_remaining_get(&underglow_tick)) { // Check if timer is not already running
+                LOG_DBG("Layer effects off, standard effect %d is on, restarting tick timer.", state.current_effect);
+                k_timer_start(&underglow_tick, K_NO_WAIT, K_MSEC(50));
+             }
+        }
         return;
+    }
 
     const struct zmk_behavior_binding *rgbmap = rgb_underglow_get_bindings(layer);
-    if (rgbmap != NULL && zmk_rgb_underglow_apply_rgbmap(rgbmap, ZMK_KEYMAP_LEN)) {
-        if (!state.on)
-            zmk_rgb_underglow_transient_on();
-        k_timer_stop(&underglow_tick);
-        state.animation_step = 0;
-        int fade_delay = zmk_rgbmap_fade_delay(layer);
-        if (fade_delay >= 0) {
-            k_timer_start(&underglow_tick, K_SECONDS(fade_delay), K_MSEC(50));
+    if (rgbmap != NULL) {
+        LOG_DBG("Found rgbmap for layer %d", layer);
+        if (zmk_rgb_underglow_apply_rgbmap(rgbmap, ZMK_KEYMAP_LEN)) {
+            LOG_DBG("Applied rgbmap for layer %d successfully.", layer);
+            if (!state.on) {
+                LOG_DBG("RGB was off, turning on transiently for layer effect.");
+                zmk_rgb_underglow_transient_on();
+            }
+            // Stop standard effect timer if layer effect is active
+            if (k_timer_remaining_get(&underglow_tick) > 0 || k_timer_status_get(&underglow_tick) > 0) {
+                 LOG_DBG("Stopping standard effect timer for layer effect.");
+                 k_timer_stop(&underglow_tick);
+            }
+            state.animation_step = 0; // Reset animation step for layer effect fade
+            int fade_delay = zmk_rgbmap_fade_delay(layer);
+            if (fade_delay >= 0) {
+                LOG_DBG("Layer %d has fade_delay %d, starting layer effect timer.", layer, fade_delay);
+                // Use underglow_tick timer for fade if layer effect is active
+                k_timer_start(&underglow_tick, K_SECONDS(fade_delay), K_MSEC(50));
+            }
+            LOG_DBG("Writing pixels for layer %d effect.", layer);
+            zmk_led_write_pixels();
+        } else { // rgbmap apply returned 0
+            LOG_DBG("rgbmap apply returned 0 (no active pixels/error) for layer %d.", layer);
+            // If layer effect is enabled but no pixels were set by the map, turn off LEDs.
+            // This prevents previous standard effect from showing through.
+            if (state.on) {
+                LOG_DBG("Layer effect for layer %d resulted in no pixels, turning off LEDs transiently.", layer);
+                zmk_rgb_underglow_transient_off(); // Or clear pixels and write
+            }
         }
-        LOG_DBG("write pixels");
-        zmk_led_write_pixels();
-    } else {
-        if (state.on)
+    } else { // No rgbmap for this layer
+        LOG_WRN("No rgbmap found for layer %d.", layer);
+        // If layer effects are enabled but there's no map for the current layer,
+        // turn off LEDs to avoid showing stale standard effects.
+        if (state.on) {
+            LOG_DBG("Layer effects enabled but no map for layer %d, turning off LEDs transiently.", layer);
             zmk_rgb_underglow_transient_off();
+        }
     }
 }
 #endif /* IS_ENABLED(UNDERGLOW_LAYER_ENABLED) */
@@ -944,23 +1025,35 @@ static int rgb_underglow_event_listener(const zmk_event_t *eh) {
     if (as_zmk_split_peripheral_layer_changed(eh)) {
         const struct zmk_split_peripheral_layer_changed *ev =
             as_zmk_split_peripheral_layer_changed(eh);
-        LOG_DBG("zmk_split_peripheral_layer_changed: %08x", ev->layers);
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+        LOG_DBG("Central: zmk_split_peripheral_layer_changed event: layers 0x%08x", ev->layers);
+#else
+        LOG_DBG("Peripheral: zmk_split_peripheral_layer_changed event: layers 0x%08x", ev->layers);
+#endif
 #if !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+        LOG_DBG("Peripheral: Calling set_peripheral_layers_state with 0x%08x", ev->layers);
         set_peripheral_layers_state(ev->layers);
 #endif
         uint8_t layer = rgb_underglow_top_layer();
-        LOG_DBG("top layer: %d", layer);
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+        LOG_DBG("Central: top_layer for RGB after event: %d", layer);
+#else
+        LOG_DBG("Peripheral: top_layer for RGB after event: %d", layer);
+#endif
         zmk_rgb_underglow_set_layer(layer);
-        return 0;
+        return ZMK_EV_EVENT_BUBBLE; // Return consistent with other handlers or 0 if fully handled
     }
     if (as_zmk_underglow_color_changed(eh)) {
         const struct zmk_underglow_color_changed *ev = as_zmk_underglow_color_changed(eh);
-        LOG_DBG("refresh layer %d", ev->layers);
+        LOG_DBG("refresh layer %d triggered by underglow_color_changed", ev->layers);
         uint8_t layer = rgb_underglow_top_layer();
         if ((ev->layers & (BIT(layer))) == BIT(layer)) {
+            LOG_DBG("Current top layer %d is in changed layers 0x%08x, updating RGB for this layer.", layer, ev->layers);
             zmk_rgb_underglow_set_layer(rgb_underglow_top_layer());
+        } else {
+            LOG_DBG("Current top layer %d is NOT in changed layers 0x%08x, no RGB update for this layer.", layer, ev->layers);
         }
-        return 0;
+        return ZMK_EV_EVENT_BUBBLE; // Return consistent
     }
 #endif /* UNDERGLOW_LAYER_ENABLED */
 

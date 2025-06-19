@@ -1184,14 +1184,15 @@ static void split_central_update_layers_callback(struct k_work *work) {
             continue;
         }
 
+        LOG_DBG("Central: Sending layers: 0x%08x to peripheral %d", layers, i);
         int err =
             bt_gatt_write_without_response(peripherals[i].conn, peripherals[i].update_layers_handle,
                                            &layers, sizeof(layers), true);
 
         if (err) {
-            LOG_ERR("Failed to send layers to peripheral (err %d)", err);
+            LOG_ERR("Central: Failed to send layers to peripheral %d (err %d)", i, err);
         } else {
-            LOG_DBG("Sent Layers over to peripheral");
+            LOG_DBG("Central: Sent Layers 0x%08x to peripheral %d successfully", layers, i);
             raise_zmk_split_peripheral_layer_changed(
                 (struct zmk_split_peripheral_layer_changed){.layers = layers});
         }

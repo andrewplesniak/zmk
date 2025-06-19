@@ -75,10 +75,14 @@ uint8_t rgb_underglow_top_layer_with_state(uint32_t state_to_test) {
 }
 
 uint8_t rgb_underglow_top_layer(void) {
+    uint8_t layer;
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
-    return zmk_keymap_highest_layer_active();
+    layer = zmk_keymap_highest_layer_active();
+    LOG_DBG("Central: rgb_underglow_top_layer returning %d", layer);
 #else
-    return peripheral_highest_layer_active();
+    layer = peripheral_highest_layer_active();
+    LOG_DBG("Peripheral: rgb_underglow_top_layer returning %d", layer);
 #endif
+    return layer;
 }
 #endif /* DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT) */
